@@ -10,6 +10,7 @@ dependencies = [
     "geopandas>=1.1.1",
     "pandas>=2.3.3",
     "psycopg2-binary>=2.9.10",
+    "pydantic>=2.11.10",
     "python-dotenv>=1.1.1",
     "sqlalchemy>=2.0.43",
     "uvicorn[standard]>=0.37.0",

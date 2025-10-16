@@ -44,7 +44,6 @@ def main():
         engine,
         if_exists='replace',
         index=False,
-        dtype={'geometry': Geometry('GEOMETRY', srid=4326)}
     )
     print("'regions' table created successfully.")
     
