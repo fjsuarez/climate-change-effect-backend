@@ -84,7 +84,6 @@ def get_regions(tolerance: float = 0.005, db: Session = Depends(get_db)):
         # A simpler way is to convert to a dict and let FastAPI handle it.
         # return gdf.to_dict(orient="records") # This is not GeoJSON, let's fix this.
         # The above is not correct for GeoJSON. Let's return the raw JSON string with a proper response class.
-        print(geojson_data)
         return Response(content=geojson_data, media_type="application/json")
     except Exception as e:
         print(f"An error occurred: {e}")
