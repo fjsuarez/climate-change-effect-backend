@@ -132,16 +132,17 @@ def load_temperature_distribution(engine):
     df_dist = pd.read_csv(dist_path)
     
     # Transform from wide format (columns p0, p1, ..., p100) to long format
-    # Each row becomes 101 rows (one for each percentile)
+    # Each row becomes 117 rows (one for each percentile, excluding 0% and 100%)
     records = []
     
     for _, row in df_dist.iterrows():
         urau_code = row['URAU_CODE']
-        # Each column represents a percentile (e.g., "0.0%", "1.0%", etc.)
+        # Each column represents a percentile (e.g., "0.1%", "1.0%", "99.9%", etc.)
         for col in df_dist.columns:
             if col != 'URAU_CODE' and '%' in col:
-                # Extract percentile number from column name (e.g., "10.0%" -> 10)
-                percentile = int(float(col.replace('%', '')))
+                # Extract percentile number from column name, keeping decimal precision
+                # e.g., "0.1%" -> 0.1, "10.0%" -> 10.0, "99.9%" -> 99.9
+                percentile = float(col.replace('%', ''))
                 temperature = row[col]
                 
                 if pd.notna(temperature):  # Only add if temperature value exists

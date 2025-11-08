@@ -209,16 +209,17 @@ def get_temperature_distribution():
 @app.get("/api/v1/bspline/evaluate")
 def evaluate_bspline(urau_code: str, agegroup: str, db: Session = Depends(get_db)):
     """
-    Evaluates the B-spline exposure-response curve for a specific city and age group.
+    Evaluate B-spline exposure-response function for a city and age group.
     
-    This implements the methodology from the European temperature-mortality study:
-    1. Creates a natural quadratic B-spline with knots at 10th, 75th, and 90th percentiles
-    2. Computes log relative risk across temperature percentiles
-    3. Identifies MMT (Minimum Mortality Temperature) within 25th-75th percentile range
-    4. Centers the curve at MMT (RR = 1 at MMT)
-    5. Returns temperature points and relative risk values
+    This function follows the methodology from manual_erf.ipynb:
+    1. Creates B-spline basis matrix using patsy.bs() with knots at 10th, 75th, and 90th percentiles
+    2. Computes log(RR) = basis_matrix @ coefficients
+    3. Identifies MMT (Minimum Mortality Temperature) within 25th-99th percentile range
+    4. Centers at MMT by subtracting basis values at MMT before computing log(RR)
+    5. Returns RR = exp(log(RR)) where RR = 1 at MMT
     """
     import numpy as np
+    from patsy import bs
     
     print(f"Evaluating B-spline for {urau_code}, age group {agegroup}...")
     
@@ -236,11 +237,12 @@ def evaluate_bspline(urau_code: str, agegroup: str, db: Session = Depends(get_db
         
         coefficients = np.array([coef_result.b1, coef_result.b2, coef_result.b3, coef_result.b4, coef_result.b5])
         
-        # Load full temperature distribution (all percentiles) from database
+        # Load temperature distribution from database (excluding 0th and 100th percentiles to match notebook)
+        # The notebook uses iloc[:,2:-1] which excludes first data column (0%) and last column (100%)
         dist_query = text("""
             SELECT percentile, temperature 
             FROM temperature_distribution 
-            WHERE urau_code = :urau_code
+            WHERE urau_code = :urau_code AND percentile > 0 AND percentile < 100
             ORDER BY percentile
         """)
         dist_result = db.execute(dist_query, {"urau_code": urau_code}).fetchall()
@@ -262,57 +264,50 @@ def evaluate_bspline(urau_code: str, agegroup: str, db: Session = Depends(get_db
         if None in [p10_temp, p75_temp, p90_temp, p25_temp]:
             raise HTTPException(status_code=500, detail="Missing required percentiles in temperature distribution")
         
-        # Build knot vector for natural quadratic B-spline (degree 2)
-        # For 5 coefficients: need 8 knots total
-        knots = np.array([
-            temperatures.min(), temperatures.min(), temperatures.min(),  # Left boundary (3x)
-            p10_temp, p75_temp, p90_temp,                                # Internal knots
-            temperatures.max(), temperatures.max()                        # Right boundary (2x)
-        ])
+        # Step 1: Create B-spline basis matrix (following manual_erf.ipynb approach)
+        # bs() with degree=2, knots=[p10, p75, p90], include_intercept=False creates 5 basis functions
+        knots_array = np.array([p10_temp, p75_temp, p90_temp])
+        bvar = bs(temperatures, knots=knots_array, degree=2, include_intercept=False)
         
-        # Create B-spline basis and evaluate at all temperature percentiles
-        from scipy.interpolate import BSpline
+        # Step 2: Compute log(RR) before centering
+        # bvar is shape (n_temps, 5), coefficients is shape (5,)
+        log_rr_uncentered = bvar @ coefficients
         
-        bspline = BSpline(knots, coefficients, 2)
-        log_rr_all = bspline(temperatures)
-        
-        # Step 3: Identify MMT within 25th-75th percentile range
-        # Create mask for acceptable range (25th-75th percentiles)
-        in_range = (temperatures >= p25_temp) & (temperatures <= p75_temp)
+        # Step 3: Identify MMT within 25th-99th percentile range (following notebook logic)
+        # Create mask for acceptable range
+        in_range = (percentile_values >= 25) & (percentile_values <= 99)
         
         # Find MMT: temperature with minimum log RR within acceptable range
-        valid_log_rr = log_rr_all[in_range]
-        valid_temps = temperatures[in_range]
+        valid_indices = np.where(in_range)[0]
+        valid_log_rr = log_rr_uncentered[valid_indices]
         
         if len(valid_log_rr) == 0:
             raise HTTPException(status_code=500, detail="No valid temperatures in MMT search range")
         
-        mmt_idx = np.argmin(valid_log_rr)
-        mmt = valid_temps[mmt_idx]
-        log_rr_at_mmt = valid_log_rr[mmt_idx]
+        mmt_idx_in_valid = np.argmin(valid_log_rr)
+        mmt_idx_global = valid_indices[mmt_idx_in_valid]
         
-        # Find the percentile of MMT
-        mmt_percentile = percentile_values[in_range][mmt_idx]
+        mmt = temperatures[mmt_idx_global]
+        mmt_percentile = percentile_values[mmt_idx_global]
         
-        # Step 4: Center the curve at MMT
-        # Subtract the log RR at MMT so that RR = 1 (log RR = 0) at MMT
-        log_rr_centered = log_rr_all - log_rr_at_mmt
+        # Get the basis values at MMT
+        bvar_at_mmt = bvar[mmt_idx_global, :]
         
-        # Convert to relative risk: RR = exp(log_rr_centered)
+        # Step 4: Center at MMT
+        # Following notebook: log(RR) = (bvar - bvar_at_mmt) @ coefficients
+        # This ensures log(RR) = 0 (i.e., RR = 1) at MMT
+        bvar_centered = bvar - bvar_at_mmt
+        log_rr_centered = bvar_centered @ coefficients
+        
+        # Convert to relative risk
         rr_centered = np.exp(log_rr_centered)
         
-        # Generate smooth curve for plotting (100 points)
-        temp_plot = np.linspace(temperatures.min(), temperatures.max(), 100)
-        log_rr_plot = bspline(temp_plot) - log_rr_at_mmt
-        rr_plot = np.exp(log_rr_plot)
-        
-        # Compute percentiles for plotting points by interpolation
-        percentile_plot = np.interp(temp_plot, temperatures, percentile_values)
-        
-        # Extract extreme percentile values (1st and 99th)
+        # Extract extreme percentile values (1st and 99th) from actual data points
         rr_at_p01 = rr_centered[percentile_values == 1][0] if 1 in percentile_values else None
         rr_at_p99 = rr_centered[percentile_values == 99][0] if 99 in percentile_values else None
         
+        # Return actual computed values at real percentile points (not interpolated)
+        # This matches the notebook approach and provides accurate tooltip values
         return {
             "urau_code": urau_code,
             "agegroup": agegroup,
@@ -338,7 +333,7 @@ def evaluate_bspline(urau_code: str, agegroup: str, db: Session = Depends(get_db
                     "percentile": float(p),
                     "value": float(rr)
                 }
-                for t, p, rr in zip(temp_plot, percentile_plot, rr_plot)
+                for t, p, rr in zip(temperatures, percentile_values, rr_centered)
             ]
         }
     

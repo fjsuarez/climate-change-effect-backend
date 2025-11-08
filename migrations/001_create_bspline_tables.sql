@@ -36,7 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_bspline_urau_age ON bspline_coefficients(urau_cod
 CREATE TABLE IF NOT EXISTS temperature_distribution (
   id bigserial PRIMARY KEY,
   urau_code text NOT NULL,
-  percentile smallint NOT NULL CHECK (percentile >= 0 AND percentile <= 100),
+  percentile numeric(5,1) NOT NULL CHECK (percentile >= 0 AND percentile <= 100),
   temperature double precision NOT NULL,
   created_at timestamptz DEFAULT now(),
   updated_at timestamptz DEFAULT now(),
