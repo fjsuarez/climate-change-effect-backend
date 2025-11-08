@@ -346,6 +346,77 @@ def evaluate_bspline(urau_code: str, agegroup: str, db: Session = Depends(get_db
         raise HTTPException(status_code=500, detail=f"Error evaluating B-spline: {str(e)}")
 
 
+@app.get("/api/v1/temperature-histogram/{urau_code}")
+def get_temperature_histogram(urau_code: str, bins: int = 30, db: Session = Depends(get_db)):
+    """
+    Returns pre-computed temperature histogram for a specific city.
+    
+    Args:
+        urau_code: URAU city code (e.g., 'AT001C')
+        bins: Number of bins (20, 30, or 50). Default is 30.
+    
+    Returns:
+        Histogram data with temperature bins and day counts from 1990-2019 ERA5 data.
+    """
+    print(f"Fetching temperature histogram for {urau_code} with {bins} bins...")
+    
+    # Validate bins parameter
+    if bins not in [20, 30, 50]:
+        raise HTTPException(
+            status_code=400, 
+            detail="bins parameter must be 20, 30, or 50"
+        )
+    
+    try:
+        query = text("""
+            SELECT 
+                bin_start,
+                bin_end,
+                bin_center,
+                count
+            FROM temperature_histogram
+            WHERE urau_code = :urau_code AND bins_total = :bins
+            ORDER BY bin_start
+        """)
+        
+        result = db.execute(query, {"urau_code": urau_code, "bins": bins}).fetchall()
+        
+        if not result:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No histogram data found for {urau_code} with {bins} bins"
+            )
+        
+        # Format response
+        histogram_data = [
+            {
+                "bin_start": float(row.bin_start),
+                "bin_end": float(row.bin_end),
+                "bin_center": float(row.bin_center),
+                "count": int(row.count)
+            }
+            for row in result
+        ]
+        
+        # Calculate total days for verification
+        total_days = sum(item["count"] for item in histogram_data)
+        
+        return {
+            "urau_code": urau_code,
+            "bins_total": bins,
+            "total_days": total_days,
+            "data": histogram_data
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching histogram: {str(e)}")
+
+
 @app.get("/api/v1/coefficients/cities")
 def get_cities(db: Session = Depends(get_db)):
     """
