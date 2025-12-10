@@ -28,7 +28,7 @@ app = FastAPI()
 # Allow localhost for development and production URLs
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://localhost:3001"
+    "http://localhost:3000,http://localhost:3001,https://dashboard.climateinsure.tech"
 ).split(",")
 
 app.add_middleware(
