@@ -26,10 +26,21 @@ app = FastAPI()
 
 # Add CORS middleware - MUST be before other middleware
 # Allow localhost for development and production URLs
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://localhost:3001,https://dashboard.climateinsure.tech"
-).split(",")
+env_origins = os.getenv("ALLOWED_ORIGINS", "")
+origins_list = env_origins.split(",") if env_origins else []
+
+# Always allow these critical domains
+required_origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://dashboard.climateinsure.tech"
+]
+
+ALLOWED_ORIGINS = list(set(origins_list + required_origins))
+
+print(f"Allowed Origins: {ALLOWED_ORIGINS}")
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,8 +49,6 @@ app.add_middleware(
     allow_methods=["*"],  # Allow all HTTP methods
     allow_headers=["*"],  # Allow all headers
 )
-
-app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
