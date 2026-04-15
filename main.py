@@ -717,6 +717,16 @@ class ClimateRiskRequest(BaseModel):
         default=None,
         description="Portfolio data. If not provided, sample portfolio is used"
     )
+    n_policies: int = Field(
+        default=100,
+        ge=10,
+        le=1000,
+        description="Number of policies in sample portfolio (used if portfolio not provided)"
+    )
+    portfolio_mix: str = Field(
+        default="annuity_heavy",
+        description="Portfolio composition: 'annuity_heavy' (60/40), 'balanced' (50/50), or 'insurance_heavy' (40/60)"
+    )
     mortality_table: Optional[List[MortalityRateInput]] = Field(
         default=None,
         description="Baseline mortality table. If not provided, sample table is used"
@@ -860,7 +870,11 @@ def analyze_climate_risk(request: ClimateRiskRequest):
     if request.portfolio:
         portfolio_df = pd.DataFrame([p.dict() for p in request.portfolio])
     else:
-        portfolio_df = generate_sample_portfolio(n_policies=100, seed=42)
+        portfolio_df = generate_sample_portfolio(
+            n_policies=request.n_policies,
+            seed=42,
+            portfolio_mix=request.portfolio_mix
+        )
     
     # Create ERF function
     erf = create_erf_function(
@@ -891,13 +905,23 @@ def analyze_climate_risk(request: ClimateRiskRequest):
                 result[k] = v
         return result
     
+    # Map portfolio_stats keys to frontend expected format
+    ps = report['portfolio_stats']
+    portfolio_stats = {
+        "n_policies": ps['total_policies'],
+        "n_annuities": ps['annuity_policies'],
+        "n_life_insurance": ps['life_insurance_policies'],
+        "total_annuity_volume": ps['total_annuity_volume'],
+        "total_life_insurance_volume": ps['total_insurance_volume']
+    }
+    
     return {
         "scenario": round_dict_values(report['scenario'], 4),
         "mortality_impact": round_dict_values(report['mortality_impact'], 2),
         "baseline_reserves": round_dict_values(report['baseline_reserves'], 2),
         "adjusted_reserves": round_dict_values(report['adjusted_reserves'], 2),
         "climate_impact_delta": round_dict_values(report['climate_impact_delta'], 2),
-        "portfolio_stats": report['portfolio_stats']
+        "portfolio_stats": portfolio_stats
     }
 
 

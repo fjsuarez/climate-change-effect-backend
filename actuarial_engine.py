@@ -681,7 +681,8 @@ def generate_sample_mortality_table(max_age: int = 100) -> pd.DataFrame:
 
 def generate_sample_portfolio(
     n_policies: int = 100,
-    seed: int = 42
+    seed: int = 42,
+    portfolio_mix: str = 'annuity_heavy'
 ) -> pd.DataFrame:
     """
     Generate a sample insurance portfolio.
@@ -689,11 +690,20 @@ def generate_sample_portfolio(
     Args:
         n_policies: Number of policies to generate
         seed: Random seed for reproducibility
+        portfolio_mix: One of 'annuity_heavy' (60/40), 'balanced' (50/50), 'insurance_heavy' (40/60)
     
     Returns:
         DataFrame with 'age', 'product_type', 'volume' columns
     """
     np.random.seed(seed)
+    
+    # Set annuity percentage based on portfolio mix
+    mix_ratios = {
+        'annuity_heavy': 0.6,
+        'balanced': 0.5,
+        'insurance_heavy': 0.4
+    }
+    annuity_pct = mix_ratios.get(portfolio_mix, 0.6)
     
     # Generate random ages (weighted towards middle ages)
     ages = np.random.choice(
@@ -703,11 +713,11 @@ def generate_sample_portfolio(
           sum([1/(1 + abs(x-50)/20) for x in range(25, 80)])
     )
     
-    # Randomly assign product types (60% annuities, 40% life insurance)
+    # Randomly assign product types based on mix
     product_types = np.random.choice(
         ['Annuity', 'Life Insurance'],
         size=n_policies,
-        p=[0.6, 0.4]
+        p=[annuity_pct, 1 - annuity_pct]
     )
     
     # Generate volumes based on product type
