@@ -594,78 +594,40 @@ def get_time_series(
 
 
 @app.get("/api/v1/cities/with-erf")
-def get_cities_with_erf():
+def get_cities_with_erf(db: Session = Depends(get_db)):
     """
     Returns cities that have ERF (Exposure-Response Function) data with their coordinates.
-    Coordinates are computed from the URAU GeoJSON centroids, projected to EPSG:4326 (WGS84).
-    
+    Coordinates (WGS84 lon/lat) are stored in the urau_cities table.
+
     Returns a GeoJSON FeatureCollection with Point geometries for each city.
     """
-    import os
-    
     print("Fetching cities with ERF data and coordinates...")
-    
+
     try:
-        # Read the URAU GeoJSON to get city geometries
-        geojson_path = os.path.join(os.path.dirname(__file__), "data", "URAU_RG_100K_2021_3035.geojson")
-        
-        if not os.path.exists(geojson_path):
-            raise HTTPException(status_code=404, detail="URAU GeoJSON file not found")
-        
-        # Read the coefficients CSV to get list of cities with ERF data
-        csv_path = os.path.join(os.path.dirname(__file__), "data", "coefs.csv")
-        
-        if not os.path.exists(csv_path):
-            raise HTTPException(status_code=404, detail="Coefficients file not found")
-        
-        # Get unique URAU codes from coefficients
-        import csv
-        cities_with_erf = set()
-        with open(csv_path, 'r') as file:
-            reader = csv.DictReader(file)
-            for row in reader:
-                cities_with_erf.add(row["URAU_CODE"])
-        
-        # Read URAU GeoJSON with GeoPandas
-        gdf = gpd.read_file(geojson_path)
-        
-        # Filter to only cities with ERF data
-        gdf = gdf[gdf['URAU_CODE'].isin(cities_with_erf)]
-        
-        # Compute centroids (still in EPSG:3035)
-        gdf['centroid'] = gdf.geometry.centroid
-        
-        # Project centroids to WGS84 (EPSG:4326) for Mapbox
-        gdf_centroids = gdf.set_geometry('centroid')
-        gdf_centroids = gdf_centroids.to_crs(epsg=4326)
-        
-        # Build GeoJSON response
-        features = []
-        for _, row in gdf_centroids.iterrows():
-            centroid = row['centroid']
-            features.append({
+        query = text("""
+            SELECT urau_code, name, country_code, lon, lat
+            FROM urau_cities
+            WHERE lon IS NOT NULL AND lat IS NOT NULL
+            ORDER BY urau_code
+        """)
+        rows = db.execute(query).fetchall()
+
+        features = [
+            {
                 "type": "Feature",
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [centroid.x, centroid.y]
-                },
+                "geometry": {"type": "Point", "coordinates": [row.lon, row.lat]},
                 "properties": {
-                    "urau_code": row['URAU_CODE'],
-                    "name": row['URAU_NAME'],
-                    "country": row['CNTR_CODE']
-                }
-            })
-        
-        geojson = {
-            "type": "FeatureCollection",
-            "features": features
-        }
-        
+                    "urau_code": row.urau_code,
+                    "name": row.name,
+                    "country": row.country_code,
+                },
+            }
+            for row in rows
+        ]
+
         print(f"Returning {len(features)} cities with ERF data")
-        return geojson
-    
-    except HTTPException:
-        raise
+        return {"type": "FeatureCollection", "features": features}
+
     except Exception as e:
         print(f"An error occurred: {e}")
         import traceback
