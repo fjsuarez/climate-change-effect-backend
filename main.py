@@ -8,7 +8,19 @@ import geopandas as gpd
 import os
 from dotenv import load_dotenv
 from models.base import TimeSeriesDataPoint, TimeSeriesResponse
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+import numpy as np
+
+# Import the actuarial engine
+from actuarial_engine import (
+    MortalityAdjuster,
+    PortfolioValuation,
+    ClimateRiskEngine,
+    generate_sample_mortality_table,
+    generate_sample_portfolio,
+    create_erf_function
+)
 
 load_dotenv()
 
@@ -579,3 +591,408 @@ def get_time_series(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error fetching time-series data: {str(e)}")
+
+
+@app.get("/api/v1/cities/with-erf")
+def get_cities_with_erf():
+    """
+    Returns cities that have ERF (Exposure-Response Function) data with their coordinates.
+    Coordinates are computed from the URAU GeoJSON centroids, projected to EPSG:4326 (WGS84).
+    
+    Returns a GeoJSON FeatureCollection with Point geometries for each city.
+    """
+    import os
+    
+    print("Fetching cities with ERF data and coordinates...")
+    
+    try:
+        # Read the URAU GeoJSON to get city geometries
+        geojson_path = os.path.join(os.path.dirname(__file__), "data", "URAU_RG_100K_2021_3035.geojson")
+        
+        if not os.path.exists(geojson_path):
+            raise HTTPException(status_code=404, detail="URAU GeoJSON file not found")
+        
+        # Read the coefficients CSV to get list of cities with ERF data
+        csv_path = os.path.join(os.path.dirname(__file__), "data", "coefs.csv")
+        
+        if not os.path.exists(csv_path):
+            raise HTTPException(status_code=404, detail="Coefficients file not found")
+        
+        # Get unique URAU codes from coefficients
+        import csv
+        cities_with_erf = set()
+        with open(csv_path, 'r') as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                cities_with_erf.add(row["URAU_CODE"])
+        
+        # Read URAU GeoJSON with GeoPandas
+        gdf = gpd.read_file(geojson_path)
+        
+        # Filter to only cities with ERF data
+        gdf = gdf[gdf['URAU_CODE'].isin(cities_with_erf)]
+        
+        # Compute centroids (still in EPSG:3035)
+        gdf['centroid'] = gdf.geometry.centroid
+        
+        # Project centroids to WGS84 (EPSG:4326) for Mapbox
+        gdf_centroids = gdf.set_geometry('centroid')
+        gdf_centroids = gdf_centroids.to_crs(epsg=4326)
+        
+        # Build GeoJSON response
+        features = []
+        for _, row in gdf_centroids.iterrows():
+            centroid = row['centroid']
+            features.append({
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [centroid.x, centroid.y]
+                },
+                "properties": {
+                    "urau_code": row['URAU_CODE'],
+                    "name": row['URAU_NAME'],
+                    "country": row['CNTR_CODE']
+                }
+            })
+        
+        geojson = {
+            "type": "FeatureCollection",
+            "features": features
+        }
+        
+        print(f"Returning {len(features)} cities with ERF data")
+        return geojson
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching cities with coordinates: {str(e)}")
+
+
+# =============================================================================
+# ACTUARIAL CLIMATE RISK ENGINE ENDPOINTS
+# =============================================================================
+
+# Pydantic models for request/response
+class PolicyInput(BaseModel):
+    """Single policy in a portfolio."""
+    age: int = Field(..., ge=0, le=100, description="Age of policyholder")
+    product_type: str = Field(..., description="'Annuity' or 'Life Insurance'")
+    volume: float = Field(..., gt=0, description="Face amount or premium value")
+
+class MortalityRateInput(BaseModel):
+    """Single mortality rate entry."""
+    age: int = Field(..., ge=0, description="Age")
+    qx: float = Field(..., ge=0, le=1, description="Probability of death")
+
+class ClimateRiskRequest(BaseModel):
+    """Request model for climate risk analysis."""
+    temperature_delta: float = Field(
+        ..., 
+        ge=0, 
+        le=10,
+        description="Temperature change in degrees Celsius (e.g., 2.5)"
+    )
+    interest_rate: float = Field(
+        default=0.01,
+        ge=0,
+        le=0.2,
+        description="Technical interest rate (e.g., 0.01 for 1%)"
+    )
+    erf_risk_per_degree: float = Field(
+        default=0.02,
+        ge=0,
+        le=0.5,
+        description="Mortality increase per degree Celsius (e.g., 0.02 for 2%)"
+    )
+    erf_nonlinear: bool = Field(
+        default=False,
+        description="Use exponential (nonlinear) ERF model"
+    )
+    portfolio: Optional[List[PolicyInput]] = Field(
+        default=None,
+        description="Portfolio data. If not provided, sample portfolio is used"
+    )
+    n_policies: int = Field(
+        default=100,
+        ge=10,
+        le=1000,
+        description="Number of policies in sample portfolio (used if portfolio not provided)"
+    )
+    portfolio_mix: str = Field(
+        default="annuity_heavy",
+        description="Portfolio composition: 'annuity_heavy' (60/40), 'balanced' (50/50), or 'insurance_heavy' (40/60)"
+    )
+    mortality_table: Optional[List[MortalityRateInput]] = Field(
+        default=None,
+        description="Baseline mortality table. If not provided, sample table is used"
+    )
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "temperature_delta": 2.5,
+                "interest_rate": 0.01,
+                "erf_risk_per_degree": 0.02,
+                "erf_nonlinear": False,
+                "portfolio": [
+                    {"age": 45, "product_type": "Annuity", "volume": 100000},
+                    {"age": 55, "product_type": "Life Insurance", "volume": 250000}
+                ]
+            }
+        }
+
+class MortalityComparisonResponse(BaseModel):
+    """Response for mortality table comparison."""
+    scenario: Dict[str, Any]
+    mortality_comparison: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+
+class ClimateImpactResponse(BaseModel):
+    """Response for full climate impact analysis."""
+    scenario: Dict[str, Any]
+    mortality_impact: Dict[str, Any]
+    baseline_reserves: Dict[str, Any]
+    adjusted_reserves: Dict[str, Any]
+    climate_impact_delta: Dict[str, Any]
+    portfolio_stats: Dict[str, Any]
+
+
+@app.get("/api/v1/actuarial/sample-data")
+def get_sample_actuarial_data():
+    """
+    Get sample mortality table and portfolio data for testing.
+    
+    Returns sample data that can be used as inputs for the climate risk analysis.
+    """
+    import pandas as pd
+    
+    mortality_table = generate_sample_mortality_table(max_age=100)
+    portfolio = generate_sample_portfolio(n_policies=50, seed=42)
+    
+    return {
+        "mortality_table": mortality_table.to_dict(orient="records"),
+        "portfolio": portfolio.to_dict(orient="records"),
+        "description": {
+            "mortality_table": "Gompertz-Makeham mortality model for ages 0-100",
+            "portfolio": "Sample portfolio with 50 policies (60% annuities, 40% life insurance)"
+        }
+    }
+
+
+@app.post("/api/v1/actuarial/adjust-mortality", response_model=MortalityComparisonResponse)
+def adjust_mortality(
+    temperature_delta: float = 2.5,
+    erf_risk_per_degree: float = 0.02,
+    erf_nonlinear: bool = False
+):
+    """
+    Adjust a baseline mortality table using temperature-based ERF.
+    
+    This endpoint demonstrates Module 1 (MortalityAdjuster):
+    - Applies temperature shock to baseline mortality
+    - Returns comparison of baseline vs adjusted life tables
+    
+    Args:
+        temperature_delta: Temperature increase in °C
+        erf_risk_per_degree: Mortality increase per degree (default 2%)
+        erf_nonlinear: Use exponential model instead of linear
+    """
+    import pandas as pd
+    
+    # Generate sample mortality table
+    mortality_table = generate_sample_mortality_table(max_age=100)
+    
+    # Create ERF function
+    erf = create_erf_function(
+        base_risk=1.0,
+        risk_per_degree=erf_risk_per_degree,
+        nonlinear=erf_nonlinear
+    )
+    
+    # Create mortality adjuster
+    adjuster = MortalityAdjuster(
+        baseline_table=mortality_table,
+        temperature_delta=temperature_delta,
+        erf_function=erf
+    )
+    
+    # Get comparison table
+    comparison = adjuster.get_comparison_table()
+    summary = adjuster.get_summary_statistics()
+    
+    return {
+        "scenario": {
+            "temperature_delta_celsius": temperature_delta,
+            "relative_risk": summary['relative_risk'],
+            "erf_model": "exponential" if erf_nonlinear else "linear",
+            "erf_risk_per_degree": erf_risk_per_degree
+        },
+        "mortality_comparison": comparison.round(6).to_dict(orient="records"),
+        "summary": {
+            "baseline_life_expectancy": round(summary['baseline_life_expectancy_at_birth'], 2),
+            "adjusted_life_expectancy": round(summary['adjusted_life_expectancy_at_birth'], 2),
+            "life_expectancy_change_years": round(summary['life_expectancy_change'], 2),
+            "average_mortality_increase_pct": round(summary['avg_mortality_increase_pct'], 2)
+        }
+    }
+
+
+@app.post("/api/v1/actuarial/climate-risk-analysis", response_model=ClimateImpactResponse)
+def analyze_climate_risk(request: ClimateRiskRequest):
+    """
+    Perform full climate risk analysis on an insurance portfolio.
+    
+    This endpoint combines Module 1 (MortalityAdjuster) and Module 2 (PortfolioValuation):
+    - Applies temperature shock to create adjusted mortality table
+    - Calculates reserves under baseline and adjusted scenarios
+    - Computes the financial impact (delta) of climate change
+    
+    The analysis shows:
+    - How mortality rates change with temperature
+    - Impact on life expectancy
+    - Reserve changes for annuities (negative delta = shorter lives = lower reserves)
+    - Reserve changes for life insurance (complex effect due to timing of deaths)
+    """
+    import pandas as pd
+    
+    # Get or generate mortality table
+    if request.mortality_table:
+        mortality_df = pd.DataFrame([m.dict() for m in request.mortality_table])
+    else:
+        mortality_df = generate_sample_mortality_table(max_age=100)
+    
+    # Get or generate portfolio
+    if request.portfolio:
+        portfolio_df = pd.DataFrame([p.dict() for p in request.portfolio])
+    else:
+        portfolio_df = generate_sample_portfolio(
+            n_policies=request.n_policies,
+            seed=42,
+            portfolio_mix=request.portfolio_mix
+        )
+    
+    # Create ERF function
+    erf = create_erf_function(
+        base_risk=1.0,
+        risk_per_degree=request.erf_risk_per_degree,
+        nonlinear=request.erf_nonlinear
+    )
+    
+    # Run climate risk analysis
+    engine = ClimateRiskEngine(
+        baseline_mortality=mortality_df,
+        portfolio=portfolio_df,
+        interest_rate=request.interest_rate,
+        temperature_delta=request.temperature_delta,
+        erf_function=erf
+    )
+    
+    # Generate report
+    report = engine.generate_impact_report()
+    
+    # Round numeric values for cleaner output
+    def round_dict_values(d, decimals=2):
+        result = {}
+        for k, v in d.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                result[k] = round(v, decimals)
+            else:
+                result[k] = v
+        return result
+    
+    # Map portfolio_stats keys to frontend expected format
+    ps = report['portfolio_stats']
+    portfolio_stats = {
+        "n_policies": ps['total_policies'],
+        "n_annuities": ps['annuity_policies'],
+        "n_life_insurance": ps['life_insurance_policies'],
+        "total_annuity_volume": ps['total_annuity_volume'],
+        "total_life_insurance_volume": ps['total_insurance_volume']
+    }
+    
+    return {
+        "scenario": round_dict_values(report['scenario'], 4),
+        "mortality_impact": round_dict_values(report['mortality_impact'], 2),
+        "baseline_reserves": round_dict_values(report['baseline_reserves'], 2),
+        "adjusted_reserves": round_dict_values(report['adjusted_reserves'], 2),
+        "climate_impact_delta": round_dict_values(report['climate_impact_delta'], 2),
+        "portfolio_stats": portfolio_stats
+    }
+
+
+@app.post("/api/v1/actuarial/multi-scenario-analysis")
+def analyze_multiple_scenarios(
+    temperature_scenarios: List[float] = [1.5, 2.0, 2.5, 3.0],
+    interest_rate: float = 0.01,
+    erf_risk_per_degree: float = 0.02,
+    erf_nonlinear: bool = False,
+    n_policies: int = 100
+):
+    """
+    Analyze climate risk across multiple temperature scenarios.
+    
+    This endpoint runs the full analysis for each temperature scenario
+    and returns a comparative summary useful for stress testing.
+    
+    Args:
+        temperature_scenarios: List of temperature changes to analyze
+        interest_rate: Technical discount rate
+        erf_risk_per_degree: ERF parameter
+        erf_nonlinear: Use exponential ERF model
+        n_policies: Number of policies in sample portfolio
+    """
+    import pandas as pd
+    
+    # Generate data
+    mortality_df = generate_sample_mortality_table(max_age=100)
+    portfolio_df = generate_sample_portfolio(n_policies=n_policies, seed=42)
+    
+    # Create ERF
+    erf = create_erf_function(
+        base_risk=1.0,
+        risk_per_degree=erf_risk_per_degree,
+        nonlinear=erf_nonlinear
+    )
+    
+    results = []
+    for temp_delta in temperature_scenarios:
+        engine = ClimateRiskEngine(
+            baseline_mortality=mortality_df,
+            portfolio=portfolio_df,
+            interest_rate=interest_rate,
+            temperature_delta=temp_delta,
+            erf_function=erf
+        )
+        report = engine.generate_impact_report()
+        
+        results.append({
+            "temperature_delta": temp_delta,
+            "relative_risk": round(report['scenario']['relative_risk'], 4),
+            "life_expectancy_change": round(report['mortality_impact']['life_expectancy_change_years'], 2),
+            "baseline_reserves": round(report['baseline_reserves']['total'], 2),
+            "adjusted_reserves": round(report['adjusted_reserves']['total'], 2),
+            "delta_total": round(report['climate_impact_delta']['total'], 2),
+            "delta_pct": round(report['climate_impact_delta']['total_pct_change'], 2),
+            "delta_annuities": round(report['climate_impact_delta']['annuities'], 2),
+            "delta_life_insurance": round(report['climate_impact_delta']['life_insurance'], 2)
+        })
+    
+    return {
+        "parameters": {
+            "interest_rate": interest_rate,
+            "erf_model": "exponential" if erf_nonlinear else "linear",
+            "erf_risk_per_degree": erf_risk_per_degree,
+            "n_policies": n_policies
+        },
+        "scenarios": results,
+        "interpretation": {
+            "annuities": "Negative delta = reduced reserves needed (shorter life expectancy)",
+            "life_insurance": "Complex effect - earlier deaths mean less discounting",
+            "total": "Net portfolio impact depends on mix of products"
+        }
+    }
