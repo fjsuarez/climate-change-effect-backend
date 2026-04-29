@@ -537,7 +537,7 @@ def get_time_series(
     print(f"Fetching time-series for {nuts_id} with metrics: {metric1}, {metric2}")
     # --- Column validation to prevent SQL injection ---
     allowed_metrics = [
-        "mortality_rate", "population_density", "population",
+        "population_density", "population",
         "temp_era5_q05", "temp_era5_q50", "temp_era5_q95", 
         "temp_rcp45", "temp_rcp85", 
         "NOx", "O3", "pm10"
@@ -633,6 +633,140 @@ def get_cities_with_erf(db: Session = Depends(get_db)):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error fetching cities with coordinates: {str(e)}")
+
+
+# =============================================================================
+# MORTALITY MULTIPLIER ENDPOINTS
+# =============================================================================
+
+# Age-group boundaries matching the B-spline coefficient age groups
+AGE_GROUPS = {
+    "20-44": (20, 44),
+    "45-64": (45, 64),
+    "65-74": (65, 74),
+    "75-84": (75, 84),
+    "85+":   (85, 200),
+}
+
+
+@app.get("/api/v1/mortality-multiplier/snapshot")
+def get_mortality_multiplier_snapshot(
+    year: int,
+    rcp_scenario: str = "RCP 4.5",
+    age_group: str = "65-74",
+    db: Session = Depends(get_db),
+):
+    """
+    Returns a snapshot of mortality multipliers for all countries at a given year/RCP/age-group.
+    Response format: {country_code: multiplier_total} — mirrors the /metrics/snapshot format
+    so it can be used directly as a choropleth layer.
+
+    Country codes are 2-char ISO/NUTS-0 codes (AT, BE, DE, …).
+    """
+    if age_group not in AGE_GROUPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid age_group '{age_group}'. Must be one of: {list(AGE_GROUPS.keys())}",
+        )
+
+    age_min, age_max = AGE_GROUPS[age_group]
+
+    try:
+        query = text("""
+            SELECT country,
+                   AVG(multiplier_total) AS multiplier_total
+            FROM mortality_multiplier
+            WHERE year = :year
+              AND rcp_scenario = :rcp
+              AND age >= :age_min AND age <= :age_max
+            GROUP BY country
+        """)
+        rows = db.execute(
+            query,
+            {"year": year, "rcp": rcp_scenario, "age_min": age_min, "age_max": age_max},
+        ).fetchall()
+
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No mortality multiplier snapshot for year={year}, rcp={rcp_scenario}",
+            )
+
+        return {row.country: float(row.multiplier_total) for row in rows}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching mortality snapshot: {str(e)}")
+
+
+@app.get("/api/v1/mortality-multiplier/{country_code}")
+def get_mortality_multiplier(
+    country_code: str,
+    age_group: str = "65-74",
+    db: Session = Depends(get_db),
+):
+    """
+    Returns yearly mortality multipliers for a country, broken down by RCP scenario.
+    Multipliers are averaged over the requested age group.
+
+    Query params:
+      age_group: one of 20-44, 45-64, 65-74, 75-84, 85+  (default: 65-74)
+    """
+    country_code = country_code.upper()
+
+    if age_group not in AGE_GROUPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid age_group '{age_group}'. Must be one of: {list(AGE_GROUPS.keys())}",
+        )
+
+    age_min, age_max = AGE_GROUPS[age_group]
+
+    try:
+        query = text("""
+            SELECT rcp_scenario, year,
+                   AVG(multiplier_total) AS multiplier_total,
+                   AVG(multiplier_heat)  AS multiplier_heat,
+                   AVG(multiplier_cold)  AS multiplier_cold
+            FROM mortality_multiplier
+            WHERE country = :country
+              AND age >= :age_min AND age <= :age_max
+            GROUP BY rcp_scenario, year
+            ORDER BY rcp_scenario, year
+        """)
+        rows = db.execute(
+            query,
+            {"country": country_code, "age_min": age_min, "age_max": age_max},
+        ).fetchall()
+
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No mortality multiplier data for country '{country_code}'",
+            )
+
+        data = [
+            {
+                "rcp_scenario": row.rcp_scenario,
+                "year": row.year,
+                "multiplier_total": round(row.multiplier_total, 8),
+                "multiplier_heat":  round(row.multiplier_heat, 8),
+                "multiplier_cold":  round(row.multiplier_cold, 8),
+            }
+            for row in rows
+        ]
+
+        return {"country": country_code, "age_group": age_group, "data": data}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error fetching mortality multiplier: {str(e)}")
 
 
 # =============================================================================
